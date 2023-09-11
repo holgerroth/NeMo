@@ -212,6 +212,160 @@ class ExactStringMatchMetric(Metric):
         return self.correct.float() / self.total
 
 
+import numpy as np
+class MyF1Score(Metric):
+    def __init__(self, dist_sync_on_step=False, *args, **kwargs):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        self.add_state("tp_o", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("fp_o", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("fn_o", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("tp_b", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("fp_b", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("fn_b", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("tp_i", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("fp_i", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("fn_i", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, pred: str, target: str):
+        target = target.split(" ")[1::]
+        pred = pred.split(" ")[1::]
+
+        #print("$$$$$$$$$$$$$$ MyF1Score target1", target, type(target), len(target))
+        #print("$$$$$$$$$$$$$$ MyF1Score pred1", pred, type(pred), len(pred))
+
+        assert isinstance(target, list)
+        assert isinstance(pred, list)
+
+        if len(pred) > len(target):
+            pred = pred[0:len(target)]
+
+        if len(target) > len(pred):
+            pred = pred + (len(target) - len(pred))*['O']
+
+        # check ground truth
+        for t in target:
+            if not t in ["O", "B", "I"]:
+                raise ValueError(f"No such target {t}")
+        assert len(target) == len(pred)
+
+        target = np.asarray(target)
+        pred = np.asarray(pred)
+
+        metrics = {}
+        for t in ["O", "B", "I"]:
+            metrics[t] = {}
+            metrics[t]["tp"] = np.sum(np.logical_and(target == t, pred == t))
+            metrics[t]["fp"] = np.sum(np.logical_and(target != t, pred == t))
+            metrics[t]["fn"] = np.sum(np.logical_and(target == t, pred != t))
+            assert(metrics[t]["tp"] + metrics[t]["fn"] == np.sum(target == t))
+
+        self.tp_o += metrics["O"]["tp"]
+        self.fp_o += metrics["O"]["fp"]
+        self.fn_o += metrics["O"]["fn"]
+
+        self.tp_b += metrics["B"]["tp"]
+        self.fp_b += metrics["B"]["fp"]
+        self.fn_b += metrics["B"]["fn"]
+
+        self.tp_i += metrics["I"]["tp"]
+        self.fp_i += metrics["I"]["fp"]
+        self.fn_i += metrics["I"]["fn"]
+
+        f1_o = 2 * self.tp_o / (2 * self.tp_o + self.fp_o + self.fn_o)
+        f1_b = 2 * self.tp_b / (2 * self.tp_b + self.fp_b + self.fn_b)
+        f1_i = 2 * self.tp_i / (2 * self.tp_i + self.fp_i + self.fn_i)
+
+        # return macro average
+        f1 = (f1_o + f1_b + f1_i)/3
+
+        if f1 > 0.75:
+            print("$$$ pred", pred)
+            print("$$$ target", target)
+
+    def compute(self):
+        f1_o = 2 * self.tp_o / (2 * self.tp_o + self.fp_o + self.fn_o)
+        f1_b = 2 * self.tp_b / (2 * self.tp_b + self.fp_b + self.fn_b)
+        f1_i = 2 * self.tp_i / (2 * self.tp_i + self.fp_i + self.fn_i)
+
+        # return macro average
+        return (f1_o + f1_b + f1_i)/3
+
+
+#
+# from seqeval.metrics import classification_report
+# import numpy as np
+# from sklearn import preprocessing
+# class MyF1Score(Metric):
+#     higher_is_better = True
+#
+#     def __init__(self, dist_sync_on_step=False, *args, **kwargs):
+#         super().__init__(dist_sync_on_step=dist_sync_on_step)
+#
+#         self.add_state("val_y_true", default=[], dist_reduce_fx="cat")
+#         self.add_state("val_y_pred", default=[], dist_reduce_fx="cat")
+#         self.add_state("count", default=torch.tensor(0), dist_reduce_fx=None)
+#         self.le = preprocessing.LabelEncoder()
+#         self._my_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#
+#     def update(self, pred: str, target: str):
+#         #print("$$$$$$$$$$$$$$ MyF1Score pred", pred, type(pred), len(pred))
+#         #print("$$$$$$$$$$$$$$ MyF1Score target", target, type(target), len(target))
+#         target = target.split(" ")[1::]
+#         pred = pred.split(" ")[1::]
+#
+#         #print("$$$$$$$$$$$$$$ MyF1Score target1", target, type(target), len(target))
+#         #print("$$$$$$$$$$$$$$ MyF1Score pred1", pred, type(pred), len(pred))
+#
+#         assert isinstance(target, list)
+#         assert isinstance(pred, list)
+#
+#         if len(pred) > len(target):
+#             pred = pred[0:len(target)]
+#
+#         if len(target) > len(pred):
+#             pred = pred + (len(target) - len(pred))*['O']
+#
+#         #print("$$$$$$$$$$$$$$ MyF1Score pred2", pred, type(pred), len(pred))
+#
+#         transformed = self.le.fit_transform(target + pred)
+#         target = transformed[0:len(target)]
+#         pred = transformed[len(target)::]
+#         assert len(target) == len(pred)
+#
+#         print("$$$$$$$$$$$$$$ MyF1Score target2", target, type(target), len(target))
+#         print("$$$$$$$$$$$$$$ MyF1Score pred2", pred, type(pred), len(pred))
+#
+#         self.val_y_true.append(torch.as_tensor(target).to(self._my_device))
+#         self.val_y_pred.append(torch.as_tensor(pred).to(self._my_device))
+#         self.count += 1
+#     def compute(self):
+#         _val_y_true, _val_y_pred = [], []
+#         for y_true, y_pred in zip(self.val_y_true, self.val_y_pred):
+#             y_true = y_true.cpu()
+#             y_pred = y_pred.cpu()
+#             if y_true.dim() == 0 or y_pred.dim() == 0:
+#                 y_true = [y_true]
+#                 y_pred = [y_pred]
+#             _val_y_true.append(self.le.inverse_transform(y_true).tolist())
+#             _val_y_pred.append(self.le.inverse_transform(y_pred).tolist())
+#         print(f"############ MyF1Score {self.count} _val_y_true", _val_y_true, type(_val_y_true), np.shape(_val_y_true))
+#         print(f"############ MyF1Score {self.count} _val_y_pred", _val_y_pred, type(_val_y_pred), np.shape(_val_y_pred))
+#         metric_dict = classification_report(
+#             y_true=_val_y_true,
+#             y_pred=_val_y_pred,
+#             output_dict=True, zero_division=0)
+#         print("@@@@@@@@@@@@@@@@@@@@ VALIDATION @@@@@@@@@@@@@@@@@@@@")
+#         print("@@@@@ Precision", metric_dict["macro avg"]["precision"], "@@@@@")
+#         print("@@@@@ Recall", metric_dict["macro avg"]["recall"], "@@@@@")
+#         print("@@@@@ F1-score", metric_dict["macro avg"]["f1-score"], "@@@@@")
+#         print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+#         return torch.as_tensor(metric_dict["macro avg"]["f1-score"])
+#         #else:
+#         #    print("WARNING No data, returning F1 zero")
+#         #    return torch.Tensor(0)
+
+
 class TokenF1Score(Metric):
     """Taken from the official evaluation script for v1.1 of the SQuAD dataset"""
 
