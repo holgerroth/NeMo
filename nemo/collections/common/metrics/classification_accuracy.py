@@ -213,26 +213,51 @@ class ExactStringMatchMetric(Metric):
 
 
 import numpy as np
+from collections import defaultdict
+from seqeval.metrics.sequence_labeling import get_entities
+from seqeval.metrics.v1 import _prf_divide
+
+def extract_tp_actual_correct(y_true, y_pred, suffix, *args):
+    entities_true = defaultdict(set)
+    entities_pred = defaultdict(set)
+    for type_name, start, end in get_entities(y_true, suffix):
+        entities_true[type_name].add((start, end))
+    for type_name, start, end in get_entities(y_pred, suffix):
+        entities_pred[type_name].add((start, end))
+
+    target_names = sorted(set(entities_true.keys()) | set(entities_pred.keys()))
+
+    tp_sum = np.array([], dtype=np.int32)
+    pred_sum = np.array([], dtype=np.int32)
+    true_sum = np.array([], dtype=np.int32)
+    for type_name in target_names:
+        entities_true_type = entities_true.get(type_name, set())
+        entities_pred_type = entities_pred.get(type_name, set())
+        tp_sum = np.append(tp_sum, len(entities_true_type & entities_pred_type))
+        pred_sum = np.append(pred_sum, len(entities_pred_type))
+        true_sum = np.append(true_sum, len(entities_true_type))
+
+    return pred_sum, tp_sum, true_sum
+
+
 class MyF1Score(Metric):
+    higher_is_better = True
     def __init__(self, dist_sync_on_step=False, *args, **kwargs):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
+        self.add_state("pred_sum", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("tp_sum", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("true_sum", default=torch.tensor(0), dist_reduce_fx="sum")
 
-        self.add_state("tp_o", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("fp_o", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("fn_o", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("tp_b", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("fp_b", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("fn_b", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("tp_i", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("fp_i", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("fn_i", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("good", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("bad", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, pred: str, target: str):
-        target = target.split(" ")[1::]
-        pred = pred.split(" ")[1::]
+        target = target.split(" ")
+        pred = pred.split(" ")
 
-        #print("$$$$$$$$$$$$$$ MyF1Score target1", target, type(target), len(target))
-        #print("$$$$$$$$$$$$$$ MyF1Score pred1", pred, type(pred), len(pred))
+        if target[0] not in ["O", "B", "I"]:
+            target = target[1::]
+            pred = pred[1::]
 
         assert isinstance(target, list)
         assert isinstance(pred, list)
@@ -245,125 +270,68 @@ class MyF1Score(Metric):
 
         # check ground truth
         for t in target:
-            if not t in ["O", "B", "I"]:
-                raise ValueError(f"No such target {t}")
+            if t not in ["O", "B", "I"]:
+                raise ValueError(f"No such target `{t}`")
         assert len(target) == len(pred)
 
-        target = np.asarray(target)
-        pred = np.asarray(pred)
+        #print("$$$$$$$$$$$$$$ MyF1Score target1", target, type(target), len(target))
+        #print("$$$$$$$$$$$$$$ MyF1Score pred1", pred, type(pred), len(pred))
 
-        metrics = {}
-        for t in ["O", "B", "I"]:
-            metrics[t] = {}
-            metrics[t]["tp"] = np.sum(np.logical_and(target == t, pred == t))
-            metrics[t]["fp"] = np.sum(np.logical_and(target != t, pred == t))
-            metrics[t]["fn"] = np.sum(np.logical_and(target == t, pred != t))
-            assert(metrics[t]["tp"] + metrics[t]["fn"] == np.sum(target == t))
+        try:
+            pred_sum, tp_sum, true_sum = extract_tp_actual_correct(y_true=target, y_pred=pred, suffix=False)
 
-        self.tp_o += metrics["O"]["tp"]
-        self.fp_o += metrics["O"]["fp"]
-        self.fn_o += metrics["O"]["fn"]
-
-        self.tp_b += metrics["B"]["tp"]
-        self.fp_b += metrics["B"]["fp"]
-        self.fn_b += metrics["B"]["fn"]
-
-        self.tp_i += metrics["I"]["tp"]
-        self.fp_i += metrics["I"]["fp"]
-        self.fn_i += metrics["I"]["fn"]
-
-        f1_o = 2 * self.tp_o / (2 * self.tp_o + self.fp_o + self.fn_o)
-        f1_b = 2 * self.tp_b / (2 * self.tp_b + self.fp_b + self.fn_b)
-        f1_i = 2 * self.tp_i / (2 * self.tp_i + self.fp_i + self.fn_i)
-
-        # return macro average
-        f1 = (f1_o + f1_b + f1_i)/3
-
-        if f1 > 0.75:
-            print("$$$ pred", pred)
-            print("$$$ target", target)
+            #print("pred_sum", pred_sum)
+            #print("tp_sum", tp_sum)
+            #print("true_sum", true_sum)
+            #print("size pred_sum", pred_sum.size)
+            #if pred_sum.size > 0:
+            self.pred_sum += pred_sum.sum()
+            self.tp_sum += tp_sum.sum()
+            self.true_sum += true_sum.sum()
+        except Exception as e:
+            print(f"WARNING: extract_tp_actual_correct failed with: {e}")
+            print("$$$$$$$$$$$$$$ MyF1Score Exception target", target, type(target), len(target))
+            print("$$$$$$$$$$$$$$ MyF1Score Exception pred  ", pred, type(pred), len(pred))
 
     def compute(self):
-        f1_o = 2 * self.tp_o / (2 * self.tp_o + self.fp_o + self.fn_o)
-        f1_b = 2 * self.tp_b / (2 * self.tp_b + self.fp_b + self.fn_b)
-        f1_i = 2 * self.tp_i / (2 * self.tp_i + self.fp_i + self.fn_i)
+        average = None
+        warn_for = ('precision', 'recall', 'f-score')
+        zero_division = 0
+        beta = 1.0
+        beta2 = 1.0
 
-        # return macro average
-        return (f1_o + f1_b + f1_i)/3
+        # Divide, and on zero-division, set scores and/or warn according to
+        # zero_division:
+        precision = _prf_divide(
+            numerator=np.asarray([self.tp_sum.cpu()]),
+            denominator=np.asarray([self.pred_sum.cpu()]),
+            metric='precision',
+            modifier='predicted',
+            average=average,
+            warn_for=warn_for,
+            zero_division=zero_division
+        )
+        recall = _prf_divide(
+            numerator=np.asarray([self.tp_sum.cpu()]),
+            denominator=np.asarray([self.true_sum.cpu()]),
+            metric='recall',
+            modifier='true',
+            average=average,
+            warn_for=warn_for,
+            zero_division=zero_division
+        )
 
+        # if tp == 0 F will be 1 only if all predictions are zero, all labels are
+        # zero, and zero_division=1. In all other case, 0
+        if np.isposinf(beta):
+            f_score = recall
+        else:
+            denom = beta2 * precision + recall
 
-#
-# from seqeval.metrics import classification_report
-# import numpy as np
-# from sklearn import preprocessing
-# class MyF1Score(Metric):
-#     higher_is_better = True
-#
-#     def __init__(self, dist_sync_on_step=False, *args, **kwargs):
-#         super().__init__(dist_sync_on_step=dist_sync_on_step)
-#
-#         self.add_state("val_y_true", default=[], dist_reduce_fx="cat")
-#         self.add_state("val_y_pred", default=[], dist_reduce_fx="cat")
-#         self.add_state("count", default=torch.tensor(0), dist_reduce_fx=None)
-#         self.le = preprocessing.LabelEncoder()
-#         self._my_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#
-#     def update(self, pred: str, target: str):
-#         #print("$$$$$$$$$$$$$$ MyF1Score pred", pred, type(pred), len(pred))
-#         #print("$$$$$$$$$$$$$$ MyF1Score target", target, type(target), len(target))
-#         target = target.split(" ")[1::]
-#         pred = pred.split(" ")[1::]
-#
-#         #print("$$$$$$$$$$$$$$ MyF1Score target1", target, type(target), len(target))
-#         #print("$$$$$$$$$$$$$$ MyF1Score pred1", pred, type(pred), len(pred))
-#
-#         assert isinstance(target, list)
-#         assert isinstance(pred, list)
-#
-#         if len(pred) > len(target):
-#             pred = pred[0:len(target)]
-#
-#         if len(target) > len(pred):
-#             pred = pred + (len(target) - len(pred))*['O']
-#
-#         #print("$$$$$$$$$$$$$$ MyF1Score pred2", pred, type(pred), len(pred))
-#
-#         transformed = self.le.fit_transform(target + pred)
-#         target = transformed[0:len(target)]
-#         pred = transformed[len(target)::]
-#         assert len(target) == len(pred)
-#
-#         print("$$$$$$$$$$$$$$ MyF1Score target2", target, type(target), len(target))
-#         print("$$$$$$$$$$$$$$ MyF1Score pred2", pred, type(pred), len(pred))
-#
-#         self.val_y_true.append(torch.as_tensor(target).to(self._my_device))
-#         self.val_y_pred.append(torch.as_tensor(pred).to(self._my_device))
-#         self.count += 1
-#     def compute(self):
-#         _val_y_true, _val_y_pred = [], []
-#         for y_true, y_pred in zip(self.val_y_true, self.val_y_pred):
-#             y_true = y_true.cpu()
-#             y_pred = y_pred.cpu()
-#             if y_true.dim() == 0 or y_pred.dim() == 0:
-#                 y_true = [y_true]
-#                 y_pred = [y_pred]
-#             _val_y_true.append(self.le.inverse_transform(y_true).tolist())
-#             _val_y_pred.append(self.le.inverse_transform(y_pred).tolist())
-#         print(f"############ MyF1Score {self.count} _val_y_true", _val_y_true, type(_val_y_true), np.shape(_val_y_true))
-#         print(f"############ MyF1Score {self.count} _val_y_pred", _val_y_pred, type(_val_y_pred), np.shape(_val_y_pred))
-#         metric_dict = classification_report(
-#             y_true=_val_y_true,
-#             y_pred=_val_y_pred,
-#             output_dict=True, zero_division=0)
-#         print("@@@@@@@@@@@@@@@@@@@@ VALIDATION @@@@@@@@@@@@@@@@@@@@")
-#         print("@@@@@ Precision", metric_dict["macro avg"]["precision"], "@@@@@")
-#         print("@@@@@ Recall", metric_dict["macro avg"]["recall"], "@@@@@")
-#         print("@@@@@ F1-score", metric_dict["macro avg"]["f1-score"], "@@@@@")
-#         print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
-#         return torch.as_tensor(metric_dict["macro avg"]["f1-score"])
-#         #else:
-#         #    print("WARNING No data, returning F1 zero")
-#         #    return torch.Tensor(0)
+            denom[denom == 0.] = 1  # avoid division by 0
+            f_score = (1 + beta2) * precision * recall / denom
+
+        return f_score
 
 
 class TokenF1Score(Metric):
