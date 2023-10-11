@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import itertools
+import os
 import queue
 import warnings
 from dataclasses import fields
@@ -41,6 +42,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     get_ltor_masks_and_position_ids,
     get_params_for_weight_decay_optimization,
 )
+from nemo.collections.nlp.modules.common.text_generation_strategy import TextGenerationStrategy
 from nemo.collections.nlp.modules.common.text_generation_utils import (
     generate,
     get_computeprob_response,
@@ -54,6 +56,7 @@ from nemo.collections.nlp.modules.common.transformer.text_generation import (
     SamplingParam,
     TextGeneration,
 )
+from nemo.collections.nlp.parts import utils_funcs
 from nemo.collections.nlp.parts.utils_funcs import activation_to_func, get_last_rank
 from nemo.core.classes import Exportable
 from nemo.core.classes.common import PretrainedModelInfo
@@ -114,15 +117,7 @@ class MegatronGPTExportableModel(torch.nn.Module, Exportable):
                 margin=0, interval=1, fp8_format=transformer_engine.common.recipe.Format.E4M3
             )
 
-        self.dtype = None
-        if model.cfg['precision'] == 'bf16':
-            self.dtype = torch.bfloat16
-        elif int(model.cfg['precision']) == 32:
-            self.dtype = torch.float
-        elif int(model.cfg['precision']) == 16:
-            self.dtype = torch.float16
-        else:
-            raise ValueError(f"precision: {model.cfg['precision']} is not supported.")
+        self.dtype = utils_funcs.torch_dtype_from_precision(model.cfg.precision)
 
     def forward(self, tokens, position_ids, attention_mask):
         if self.fp8_enabled and HAVE_TE:
@@ -202,9 +197,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             raise ImportError(
                 "Apex was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
             )
-
         if not HAVE_MEGATRON_CORE:
-            raise ImportError(
+            logging.warning(
                 "megatron-core was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
             )
         # this prevents base constructor from initializing tokenizer
@@ -214,6 +208,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         self._validate_trainer()
 
         # build the transformer config
+        # TODO: add type hint once pip package is out
         self.transformer_config = self.build_transformer_config()
 
         self.megatron_amp_o2 = cfg.get('megatron_amp_O2', False)
@@ -260,15 +255,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
             self._wrap_model_for_O2()
 
-        if self.trainer.precision in ['bf16', 'bf16-mixed']:
-            self.autocast_dtype = torch.bfloat16
-        elif self.trainer.precision in [32, '32', '32-true']:
-            self.autocast_dtype = torch.float
-        elif self.trainer.precision in [16, '16', '16-mixed']:
-            self.autocast_dtype = torch.half
-        else:
-            raise ValueError('precision must be in ["32-true", "16-mixed", "bf16-mixed"]')
-
         self.enable_autocast = (
             True if (not self.megatron_amp_o2) and (self.autocast_dtype in [torch.float16, torch.bfloat16]) else False
         )
@@ -288,8 +274,16 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         self.get_attention_mask_from_fusion = self.cfg.get('get_attention_mask_from_fusion', True)
         self.initialize_ub = self.cfg.get('ub_tp_comm_overlap', False)
+        self.log_train_loss = bool(int(os.getenv("NEMO_LOG_TRAIN_LOSS", 1)))
+        self.loss_broadcast_src_rank = None
 
         self.inference_params = None
+
+        # default to false since this doesn't work with sequence parallelism currently
+        self.use_loss_mask = self.cfg.get('use_loss_mask', False)
+
+        if self.use_loss_mask and self.transformer_config.sequence_parallel:
+            raise ValueError('Loss mask is not supported with sequence parallelism.')
 
     def get_gpt_module_list(self):
         if isinstance(self.model, list):
@@ -477,7 +471,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             used_params = set()
             for bucket in buckets:
                 used_params.update(bucket)
-            buckets[-1].extend(p for p in self.parameters() if p not in used_params)
+            remaining_params = [p for p in self.parameters() if p not in used_params]
+            if remaining_params:
+                buckets.append(remaining_params)
             self.distributed_adam_buckets = buckets
 
         return super().configure_optimizers()
@@ -634,17 +630,29 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.allreduce_first_last_embeddings()
 
         ## logging
-        # we can only log on one rank if it is rank zero so we broadcast from last rank
-        # we can avoid this broadcast by updating the PTL log function to accept specific ranks
-        torch.distributed.broadcast(loss_mean, get_last_rank())
+        if self.log_train_loss:
+            # When using pipeline parallelism, loss is calculated only in the last pipeline stage and
+            # it should be casted to other pipeline stages for logging.
+            # we can avoid this broadcast by updating the PTL log function to accept specific ranks
+            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                if self.loss_broadcast_src_rank is None:
+                    dp_size = parallel_state.get_data_parallel_world_size()
+                    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                    rank_in_dp_tp_group = torch.distributed.get_rank() % (dp_size * tp_size)
+                    last_pipeline_stage_offset = (tp_size * dp_size) * (pp_size - 1)
+                    self.loss_broadcast_src_rank = last_pipeline_stage_offset + rank_in_dp_tp_group
+                torch.distributed.broadcast(
+                    loss_mean, self.loss_broadcast_src_rank, group=parallel_state.get_pipeline_model_parallel_group(),
+                )
+            self.log('reduced_train_loss', loss_mean, prog_bar=True, rank_zero_only=True, batch_size=1)
 
-        # (@adithyare) we need to check for the _scaler attribute to enable pp>1 for adapter training
-        if self.cfg.precision == 16 and hasattr(self.trainer.precision_plugin.scaler, "_scale"):
-            loss_scale = self.trainer.precision_plugin.scaler._scale
-            if loss_scale is not None:
-                self.log('loss_scale', loss_scale, batch_size=1)
+            # (@adithyare) we need to check for the _scaler attribute to enable pp>1 for adapter training
+            if self.cfg.precision == 16 and hasattr(self.trainer.precision_plugin.scaler, "_scale"):
+                loss_scale = self.trainer.precision_plugin.scaler._scale
+                if loss_scale is not None:
+                    self.log('loss_scale', loss_scale, batch_size=1)
 
-        self.log('reduced_train_loss', loss_mean, prog_bar=True, rank_zero_only=True, batch_size=1)
         lr = self._optimizer.param_groups[0]['lr']
         self.log('lr', lr, rank_zero_only=True, batch_size=1)
         self.log(
@@ -840,8 +848,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 'labels': batch['labels'],
                 'loss_mask': batch['loss_mask'],
             }
+
             if not self.mcore_gpt:
                 forward_args['checkpoint_activations_all_layers'] = checkpoint_activations_all_layers
+                if not self.use_loss_mask:
+                    forward_args.pop('loss_mask')
             else:
                 # TODO: @eharper can we add this to mcore?
                 forward_args.pop('loss_mask')
@@ -898,16 +909,16 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 if attention_mask is not None:
                     attention_mask = attention_mask.cuda()
                     attention_mask = attention_mask[0:1]
-            if self.mcore_gpt:
-                # if first step, then clear KV cache, otherwise reuse inference_paarms
-                if set_inference_key_value_memory[0].item():
-                    self.inference_params = InferenceParams(
-                        max_batch_size=tokens.size(0), max_sequence_length=inference_max_sequence_len[0].item()
-                    )
-                extra_arg['inference_params'] = self.inference_params
-            else:
-                extra_arg['set_inference_key_value_memory'] = set_inference_key_value_memory[0].item()
-                extra_arg['inference_max_sequence_len'] = inference_max_sequence_len[0].item()
+                if self.mcore_gpt:
+                    # if first step, then clear KV cache, otherwise reuse inference_paarms
+                    if set_inference_key_value_memory[0].item():
+                        self.inference_params = InferenceParams(
+                            max_batch_size=tokens.size(0), max_sequence_length=inference_max_sequence_len[0].item()
+                        )
+                    extra_arg['inference_params'] = self.inference_params
+                else:
+                    extra_arg['set_inference_key_value_memory'] = set_inference_key_value_memory[0].item()
+                    extra_arg['inference_max_sequence_len'] = inference_max_sequence_len[0].item()
             output_tensor = model(tokens, position_ids, attention_mask, **extra_arg)
 
             # Advance inference sequence offset.
@@ -966,8 +977,19 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         else:
             averaged_loss = torch.tensor(0.0, dtype=torch.float32).cuda()
 
-        # we can only log on one rank if it is rank zero so we broadcast from last rank
-        torch.distributed.broadcast(averaged_loss, get_last_rank())
+        # When using pipeline parallelism, loss is calculated only in the last pipeline stage and
+        # it should be casted to other pipeline stages for logging.
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            if self.loss_broadcast_src_rank is None:
+                dp_size = parallel_state.get_data_parallel_world_size()
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                rank_in_dp_tp_group = torch.distributed.get_rank() % (dp_size * tp_size)
+                last_pipeline_stage_offset = (tp_size * dp_size) * (pp_size - 1)
+                self.loss_broadcast_src_rank = last_pipeline_stage_offset + rank_in_dp_tp_group
+            torch.distributed.broadcast(
+                averaged_loss, self.loss_broadcast_src_rank, group=parallel_state.get_pipeline_model_parallel_group(),
+            )
 
         self.log('val_loss', averaged_loss, prog_bar=True, rank_zero_only=True, batch_size=1)
         self.validation_step_outputs.clear()  # free memory
@@ -1180,6 +1202,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         inputs: Union[List[str], torch.Tensor, List[dict]],
         length_params: LengthParam,
         sampling_params: SamplingParam = None,
+        *,
+        strategy: Optional[TextGenerationStrategy] = None,
     ) -> OutputType:
 
         # check whether the DDP is initialized
@@ -1205,7 +1229,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if length_params is None:
             length_params = get_default_length_params()
 
-        return megatron_gpt_generate(self.cuda(), inputs, self.tokenizer, length_params, sampling_params)
+        strategy_args = {} if strategy is None else {"strategy": strategy}
+
+        return megatron_gpt_generate(
+            self.cuda(), inputs, self.tokenizer, length_params, sampling_params, **strategy_args
+        )
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: Optional[int] = None) -> Any:
         inference_config = self.get_inference_config()
@@ -1305,17 +1333,22 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         # mcore uses distributed checkpointing
         if self.mcore_gpt:
-            for index, module in enumerate(self.get_gpt_module_list()):
-                if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-                    checkpoint_state_dict = checkpoint['state_dict'][f'model_{index}']
-                else:
-                    checkpoint_state_dict = checkpoint['state_dict']
-                # checkpoint_state_dict has "model." but module does not so we need to remove it when loading
-                checkpoint_state_dict = {
-                    key.replace('model.', ''): checkpoint_state_dict.pop(key)
-                    for key in list(checkpoint_state_dict.keys())
-                }
-                module.load_state_dict(checkpoint_state_dict, strict=True)
+            if 'state_dict' in checkpoint and checkpoint['state_dict']:
+                for index, module in enumerate(self.get_gpt_module_list()):
+                    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                        checkpoint_state_dict = checkpoint['state_dict'][f'model_{index}']
+                    else:
+                        checkpoint_state_dict = checkpoint['state_dict']
+                    # checkpoint_state_dict has "model." but module does not so we need to remove it when loading
+                    checkpoint_state_dict = {
+                        key.replace('model.', ''): checkpoint_state_dict.pop(key)
+                        for key in list(checkpoint_state_dict.keys())
+                    }
+                    module.load_state_dict(checkpoint_state_dict, strict=True)
+            else:
+                # when restoring a distributed checkpoint from a ptl checkpoint we need to defer loading the state_dict
+                # see NLPModel.on_load_checkpoint
+                checkpoint['state_dict'] = {}
 
         # legacy checkpointing for interleaved
         else:
@@ -1328,7 +1361,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
     def sharded_state_dict(self, prefix: str = '') -> Dict[str, Any]:
         """
         Creates the sharded state dict which is used by dist_checkpoint to save the sharded tensors to disk.
-        When given the sharded_stated_dict, dist_checkpoint.load will load the tensors corresponding to 
+        When given the sharded_stated_dict, dist_checkpoint.load will load the tensors corresponding to
         self.state_dict().
         The sharded tensor mapping is defined in the GPTModel class from mcore.
         """
@@ -1460,7 +1493,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
     def build_transformer_config(self) -> TransformerConfig:
         """ Builds the megatron core gpt transformer config for the model.
-            For attributes in the nemo model config that are the same 
+            For attributes in the nemo model config that are the same
             as the megatron core TransformerConfig, we will use the value from the nemo model config.
             For attributes in TransformerConfig that are not in the nemo model config, we add custom logic.
         """
@@ -1482,10 +1515,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         activation_func = activation_to_func(activation)
 
         normalization = self.cfg.get('normalization', 'layernorm')
+        layernorm_zero_centered_gamma = self.cfg.get('normalization', 'layernorm') == 'layernorm1p'
         if normalization == 'layernorm':
             normalization = 'LayerNorm'
         elif normalization == 'rmsnorm':
             normalization = 'RMSNorm'
+        elif normalization == 'layernorm1p':
+            normalization = 'LayerNorm'
+            layernorm_zero_centered_gamma = True
         else:
             logging.warning(
                 f"The normalization type: {normalization} might not be supported in megatron core."
@@ -1529,7 +1566,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # any configs that are not in the nemo model config will be added here
         config_mapping = {
             'apply_residual_connection_post_layernorm': False,  # we don't use this in NeMo
-            'layernorm_zero_centered_gamma': False,  # not currently used in NeMo
+            'layernorm_zero_centered_gamma': layernorm_zero_centered_gamma,
             'add_bias_linear': add_bias_linear,
             'gated_linear_unit': gated_linear_unit,
             'activation_func': activation_func,
