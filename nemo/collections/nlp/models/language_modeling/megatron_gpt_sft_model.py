@@ -15,6 +15,7 @@ import itertools
 import json
 from functools import partial
 from typing import Any, Optional
+import numpy
 
 import torch
 from omegaconf import DictConfig, ListConfig
@@ -569,6 +570,8 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         averaged_metric = sum(averaged_metric) / len(averaged_metric) if len(averaged_metric) >= 1 else None
 
         # Handle case where metrics can be nan or inf. This can break checkpoint save/load.
+        if isinstance(averaged_metric, numpy.ndarray):
+            averaged_metric = torch.Tensor(averaged_metric)
         if averaged_metric is not None and (torch.isinf(averaged_metric) or torch.isnan(averaged_metric)):
             app_state = AppState()
             monitor_mode = app_state.checkpoint_callback_params.mode

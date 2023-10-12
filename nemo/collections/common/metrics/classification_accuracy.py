@@ -204,6 +204,8 @@ class ExactStringMatchMetric(Metric):
         self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, pred: str, target: str):
+#        print("$$$1 pred", pred)
+#        print("$$$2 target", target)
         if pred == target:
             self.correct += 1
         self.total += 1
