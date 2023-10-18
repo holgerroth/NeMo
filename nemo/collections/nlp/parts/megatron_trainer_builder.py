@@ -29,6 +29,8 @@ from nemo.collections.nlp.parts.nlp_overrides import (
 )
 from nemo.utils import logging
 
+from nemo_nvflare.callbacks import RestoreOptimizers
+
 
 class MegatronTrainerBuilder:
     """
@@ -97,7 +99,7 @@ class MegatronTrainerBuilder:
     def create_trainer(self) -> Trainer:
         strategy = self._training_strategy()
         plugins = self._plugins()
-        return Trainer(plugins=plugins, strategy=strategy, **self.cfg.trainer, callbacks=[CustomProgressBar()])
+        return Trainer(plugins=plugins, strategy=strategy, **self.cfg.trainer, callbacks=[CustomProgressBar(), RestoreOptimizers()])
 
 
 class MegatronBertTrainerBuilder(MegatronTrainerBuilder):
