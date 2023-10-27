@@ -402,9 +402,10 @@ class SquareRootAnnealing(WarmupPolicy):
 
 class CosineAnnealing(WarmupAnnealHoldPolicy):
     def __init__(self, optimizer, *, max_steps, min_lr=0, last_epoch=-1, **kwargs):
-        super().__init__(optimizer=optimizer, max_steps=max_steps, last_epoch=last_epoch, min_lr=min_lr, **kwargs)
+        super().__init__(optimizer=optimizer, max_steps=1100, last_epoch=last_epoch, min_lr=min_lr, **kwargs)
 
     def _get_lr(self, step):
+        print("DEBUG _get_lr max_steps", self.max_steps, "warmup_steps", self.warmup_steps, "min_lr", self.min_lr)
         for initial_lr in self.base_lrs:
             if initial_lr < self.min_lr:
                 raise ValueError(
@@ -426,6 +427,7 @@ class CosineAnnealing(WarmupAnnealHoldPolicy):
         return new_lrs
 
     def _get_warmup_lr(self, step):
+        print("DEBUG _get_warmup_lr max_steps", self.max_steps, "warmup_steps", self.warmup_steps, "min_lr", self.min_lr)
         if self.constant_steps is None or self.constant_steps == 0:
             return super()._get_warmup_lr(step)
         else:
@@ -433,10 +435,12 @@ class CosineAnnealing(WarmupAnnealHoldPolicy):
             return self._get_linear_warmup_with_cosine_annealing_lr(step)
 
     def _get_constant_lr(self, step):
+        print("DEBUG _get_constant_lr max_steps", self.max_steps, "warmup_steps", self.warmup_steps, "min_lr", self.min_lr)
         # Only called when `constant_steps` > 0.
         return self._get_linear_warmup_with_cosine_annealing_lr(step)
 
     def _get_linear_warmup_with_cosine_annealing_lr(self, step):
+        print("DEBUG _get_linear_warmup_with_cosine_annealing_lr max_steps", self.max_steps, "warmup_steps", self.warmup_steps, "min_lr", self.min_lr)
         # Cosine Schedule for Megatron LM, slightly different warmup schedule + constant LR at the end.
         new_lrs = [
             _linear_warmup_with_cosine_annealing(

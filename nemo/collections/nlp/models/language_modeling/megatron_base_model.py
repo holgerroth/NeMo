@@ -482,6 +482,7 @@ class MegatronBaseModel(NLPModel):
         return super().setup_optimization(optim_config=optim_config, optim_kwargs=optim_kwargs)
 
     def configure_optimizers(self):
+        print("@@@@@@@ DEBUG sched 0")
         self.setup_optimization()
 
         # Wrap the baseline optimizer with the optimizer class with master parameters
@@ -522,13 +523,18 @@ class MegatronBaseModel(NLPModel):
                 grad_allreduce_chunk_size_mb=self.cfg.get('grad_allreduce_chunk_size_mb', 125),
             )
 
+            print("@@@@@@@ DEBUG sched 1")
             assert self._trainer.max_steps is not None, "'max_steps' is missing in trainer config."
             if hasattr(self._cfg.optim, 'sched'):
                 sched_config = self._cfg.optim.sched
-                sched_config['max_steps'] = self._trainer.max_steps
+                print("@@@@@@@ DEBUG sched 2")
+                #sched_config['max_steps'] = self._trainer.max_steps
+                print("@@@@@@@@@@ Running lr scheduler with max_steps", sched_config['max_steps'])
+                print("@@@@@@@ DEBUG sched 3")
                 self._scheduler = prepare_lr_scheduler(
                     optimizer=self._optimizer, scheduler_config=sched_config, train_dataloader=self._train_dl
                 )
+                print("@@@@@@@ DEBUG sched 4")
 
         # Configure distributed optimizer
         if self.with_distributed_adam:
